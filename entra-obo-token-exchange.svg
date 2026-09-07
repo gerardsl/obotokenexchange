@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="660" viewBox="0 0 1100 660" role="img" aria-labelledby="title description">
+  <title id="title">Entra Agent ID: the Tc, T1, and Tg token exchanges</title>
+  <desc id="description">Read from top to bottom. The user signs in through the client app, which receives Tc from Entra for the blueprint API and passes Tc to the agent. The blueprint presents its credential and names the child agent using fmi_path, receiving T1 from Entra. The child agent uses T1 as its client assertion and Tc as its user assertion to obtain Tg for Microsoft Graph. Graph accepts Tg for GET /me and returns the user's profile. Blueprint and child agent are two identities used by the same backend, not necessarily separate services. Setup and consent happen before this flow.</desc>
+  <!-- Editable source: entra-obo-token-exchange.excalidraw -->
+  <defs>
+    <style>
+      text { font-family: Helvetica, Arial, sans-serif; font-size: 16px; fill: #000000; text-anchor: middle; }
+      .actor { font-weight: 600; }
+      .lifeline { stroke: #a19f9d; stroke-width: 1; stroke-dasharray: 5 6; }
+      .message { fill: none; stroke-width: 2; }
+      .response { stroke-dasharray: 7 5; }
+      .note { font-size: 14px; }
+    </style>
+    <marker id="neutral-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10" fill="none" stroke="#605e5c" stroke-width="1.5"/>
+    </marker>
+    <marker id="tc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10" fill="none" stroke="#0078d4" stroke-width="1.5"/>
+    </marker>
+    <marker id="t1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10" fill="none" stroke="#ca5010" stroke-width="1.5"/>
+    </marker>
+    <marker id="tg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10" fill="none" stroke="#107c10" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <rect width="1100" height="660" fill="#ffffff"/>
+  <g stroke-width="1.5">
+    <rect x="20" y="18" width="100" height="50" rx="8" fill="#f3f2f1" stroke="#605e5c"/>
+    <rect x="170" y="18" width="140" height="50" rx="8" fill="#cfe4fa" stroke="#0078d4"/>
+    <rect x="360" y="18" width="140" height="50" rx="8" fill="#fff4ce" stroke="#ca5010"/>
+    <rect x="535" y="18" width="170" height="50" rx="8" fill="#dff6dd" stroke="#107c10"/>
+    <rect x="735" y="18" width="150" height="50" rx="8" fill="#f3f2f1" stroke="#605e5c"/>
+    <rect x="930" y="18" width="140" height="50" rx="8" fill="#dff6dd" stroke="#107c10"/>
+  </g>
+  <g class="actor">
+    <text x="70" y="49">User</text>
+    <text x="240" y="49">Client app</text>
+    <text x="430" y="49">Blueprint</text>
+    <text x="620" y="49">Agent identity</text>
+    <text x="810" y="49">Entra ID</text>
+    <text x="1000" y="49">Graph</text>
+  </g>
+  <g class="lifeline">
+    <path d="M70 78V600"/>
+    <path d="M240 78V600"/>
+    <path d="M430 78V600"/>
+    <path d="M620 78V600"/>
+    <path d="M810 78V600"/>
+    <path d="M1000 78V600"/>
+  </g>
+
+  <path class="message" stroke="#605e5c" marker-end="url(#neutral-arrow)" d="M70 115H240"/>
+  <text x="155" y="104">Sign in</text>
+
+  <g stroke="#0078d4" marker-end="url(#tc-arrow)" class="message">
+    <path d="M240 160H810"/>
+    <path class="response" d="M810 205H240"/>
+    <path d="M240 250H620"/>
+  </g>
+  <text x="525" y="149">1. Sign in for blueprint API</text>
+  <text x="525" y="194">Tc: for blueprint</text>
+  <text x="430" y="239">Pass Tc</text>
+
+  <g stroke="#ca5010" marker-end="url(#t1-arrow)" class="message">
+    <path d="M430 295H810"/>
+    <path class="response" d="M810 340H430"/>
+    <path class="response" d="M430 385H620"/>
+  </g>
+  <text x="620" y="284">2. Credential + fmi_path=agent</text>
+  <text x="620" y="329">T1: for token exchange</text>
+  <text x="525" y="374">T1 as credential</text>
+
+  <g stroke="#107c10" marker-end="url(#tg-arrow)" class="message">
+    <path d="M620 430H810"/>
+    <path class="response" d="M810 475H620"/>
+    <path d="M620 535H1000"/>
+    <path class="response" d="M1000 580H620"/>
+  </g>
+  <text x="715" y="419">3. OBO: T1 + Tc</text>
+  <text x="715" y="464">Tg: for Graph</text>
+  <text x="810" y="524">4. GET /me with Tg</text>
+  <text x="810" y="569">User profile (User.Read)</text>
+
+  <text class="note" x="550" y="634">Blueprint and child agent are two identities used by the same backend; the T1 handoff is conceptual.</text>
+</svg>

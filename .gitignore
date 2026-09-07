@@ -1,0 +1,9 @@
+.venv/
+.env
+.env.*
+!.env.example
+.agent_state*.json
+.agent_state*.json.tmp
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
