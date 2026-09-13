@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.parse import urlparse
@@ -149,6 +150,45 @@ class HelperTests(unittest.TestCase):
         with patch.object(demo.time, "sleep"):
             self.assertEqual(demo.retry(pending, label="OBO", consent_pending=True)["access_token"], "fake")
 
+    def test_retry_repeats_service_errors_only_for_retry_safe_operations(self):
+        fn = Mock(side_effect=[
+            demo.ApiError(503, "ServiceUnavailable", "retry later", safe_to_retry=True),
+            "ready",
+        ])
+        with patch.object(demo.time, "sleep"):
+            self.assertEqual(demo.retry(fn, label="read"), "ready")
+        self.assertEqual(fn.call_count, 2)
+
+    def test_admin_consent_accepts_graph_qualified_scopes_and_rejects_wrong_tenant(self):
+        result = {"id_token_claims": {"tid": TENANT},
+                  "scope": " ".join(f"{demo.GRAPH}/{scope}" for scope in demo.CLEANUP_PERMISSIONS)}
+        demo.require_admin_consent(result, TENANT, demo.CLEANUP_PERMISSIONS)
+        with self.assertRaises(demo.DemoError):
+            demo.require_admin_consent(result, OTHER_USER, demo.CLEANUP_PERMISSIONS)
+
+    def test_user_sign_in_denial_is_not_retried_or_switched_to_another_mode(self):
+        for mode in ("device_code", "interactive"):
+            with self.subTest(mode=mode):
+                app = Mock()
+                app.initiate_device_flow.return_value = {"user_code": "OFFLINE", "message": "Offline only"}
+                denied = {"error": "access_denied", "error_description": "Sign-in was cancelled.",
+                          "correlation_id": "offline-correlation"}
+                app.acquire_token_by_device_flow.return_value = denied
+                app.acquire_token_interactive.return_value = denied
+                with patch.object(demo.msal, "PublicClientApplication", return_value=app), \
+                        patch.object(demo.time, "sleep") as sleep:
+                    with self.assertRaises(demo.ApiError) as caught:
+                        demo.sign_in(USER, "https://login.microsoftonline.com/" + TENANT,
+                                     ["User.Read"], mode, "Offline sign-in")
+                self.assertIn("offline-correlation", str(caught.exception))
+                sleep.assert_not_called()
+                if mode == "device_code":
+                    app.acquire_token_by_device_flow.assert_called_once()
+                    app.acquire_token_interactive.assert_not_called()
+                else:
+                    app.acquire_token_interactive.assert_called_once()
+                    app.acquire_token_by_device_flow.assert_not_called()
+
     def test_request_token_is_form_encoded_and_redacts_errors(self):
         token_response = response({"access_token": "result"})
         with patch.object(demo.requests, "post", return_value=token_response) as post:
@@ -219,10 +259,51 @@ class HelperTests(unittest.TestCase):
             graph.post.assert_not_called()
             graph.patch.assert_not_called()
 
+    def test_recorded_grant_is_reused_when_collection_read_is_stale(self):
+        saved = {"id": "recorded-grant", "clientId": USER, "resourceId": TENANT,
+                 "principalId": OTHER_USER, "consentType": "Principal", "scope": "User.Read"}
+        self.state.record("grant", saved)
+        graph = Mock()
+        graph.get.return_value = saved
+        graph.list.return_value = []
+        graph.post.return_value = {**saved, "id": "duplicate-grant"}
+        result = demo.ensure_graph_grant(graph, self.state, USER, TENANT, OTHER_USER)
+        self.assertEqual(result["id"], saved["id"])
+        graph.post.assert_not_called()
+
+    def test_missing_recorded_grant_is_not_silently_recreated(self):
+        saved = {"id": "recorded-grant", "clientId": USER, "resourceId": TENANT,
+                 "principalId": OTHER_USER, "consentType": "Principal", "scope": "User.Read"}
+        self.state.record("grant", saved)
+        graph = Mock()
+        graph.get.side_effect = demo.ApiError(404, "Request_ResourceNotFound", "not found")
+        graph.list.return_value = []
+        graph.post.return_value = {**saved, "id": "replacement-grant"}
+        with patch.object(demo.time, "sleep"), self.assertRaises(demo.DemoError):
+            demo.ensure_graph_grant(graph, self.state, USER, TENANT, OTHER_USER)
+        graph.post.assert_not_called()
+        self.assertEqual(self.state.resource("grant"), saved)
+
+    def test_recorded_grant_cannot_be_replaced_by_another_matching_grant(self):
+        saved = {"id": "recorded-grant", "clientId": USER, "resourceId": TENANT,
+                 "principalId": OTHER_USER, "consentType": "Principal", "scope": "User.Read"}
+        self.state.record("grant", saved)
+        graph = Mock()
+        graph.get.return_value = saved
+        graph.list.return_value = [{**saved, "id": "different-grant"}]
+        with self.assertRaises(demo.DemoError):
+            demo.ensure_graph_grant(graph, self.state, USER, TENANT, OTHER_USER)
+        self.assertEqual(self.state.resource("grant"), saved)
+        graph.post.assert_not_called()
+
     def test_only_access_denied_403_counts_as_permission_boundary(self):
         graph = Mock()
-        graph.get.side_effect = demo.ApiError(403, "Authorization_RequestDenied", "denied")
-        demo.expect_directory_denial(graph)
+        for code in ("Authorization_RequestDenied", "ErrorAccessDenied", "accessDenied"):
+            graph.get.side_effect = demo.ApiError(403, code, "denied")
+            demo.expect_directory_denial(graph)
+        graph.get.side_effect = demo.ApiError(403, "insufficient_claims", "Conditional Access challenge")
+        with self.assertRaises(demo.ApiError):
+            demo.expect_directory_denial(graph)
         for status in (400, 401, 404, 429, 500):
             graph.get.side_effect = demo.ApiError(status, "Authorization_RequestDenied", "not the expected denial")
             with self.subTest(status=status), self.assertRaises(demo.ApiError):
@@ -320,7 +401,8 @@ class FakeTenant:
             assert data["scope"] == demo.TOKEN_EXCHANGE_SCOPE
             blueprint = next(app for app in self.objects["applications"].values()
                              if app["appId"] == data["client_id"])
-            assert data["client_secret"] == blueprint["_secret"]
+            assert any(blueprint["_secrets"].get(key["keyId"]) == data["client_secret"]
+                       for key in blueprint["passwordCredentials"])
             assert any(sp.get("appId") == data["fmi_path"] and
                        sp.get("agentIdentityBlueprintId") == blueprint["appId"]
                        for sp in self.objects["servicePrincipals"].values())
@@ -350,7 +432,13 @@ class FakeTenant:
     def graph_request(self, method, url, *, json=None, params=None, headers=None, **kwargs):
         parts = urlparse(url).path.strip("/").split("/")
         assert headers["OData-Version"] == "4.0"
+        authorization = headers["Authorization"]
+        if parts[1] not in {"me", "users"}:
+            assert authorization == f"Bearer {self.admin_token}"
         if parts[1] == "me":
+            assert authorization == f"Bearer {self.admin_token}" or (
+                self.graph_token is not None and authorization == f"Bearer {self.graph_token}"
+            )
             user = USER if headers["Authorization"] == f"Bearer {self.admin_token}" else self.demo_user
             return response({"id": user, "displayName": "Offline demo member",
                              "userPrincipalName": "offline@example.invalid", "userType": "Member"})
@@ -362,7 +450,7 @@ class FakeTenant:
         if method == "GET" and item_id:
             if item_id not in store:
                 return self.not_found()
-            item = self.public(store[item_id])
+            item = self.public(store[item_id], params)
             if store[item_id].get("_type") == "microsoft.graph.agentIdentity" and self.pending_agent_reads:
                 item["appId"] = None
                 self.pending_agent_reads -= 1
@@ -374,13 +462,14 @@ class FakeTenant:
             if params and "$filter" in params:
                 for field, value in demo.re.findall(r"(\w+) eq '([^']*)'", params["$filter"]):
                     values = [item for item in values if item.get(field) == value]
-            return response({"value": [self.public(item) for item in values]})
+            return response({"value": [self.public(item, params) for item in values]})
         if method == "POST" and parts[-1] == "addPassword":
-            credential = {"keyId": self.new_id(), "secretText": "offline-private-blueprint-credential",
+            key_id = self.new_id()
+            credential = {"keyId": key_id, "secretText": f"offline-private-blueprint-credential-{key_id}",
                           **json["passwordCredential"]}
             store[item_id]["passwordCredentials"].append({key: value for key, value in credential.items()
                                                          if key != "secretText"})
-            store[item_id]["_secret"] = credential["secretText"]
+            store[item_id].setdefault("_secrets", {})[key_id] = credential["secretText"]
             self.creates.append("credential")
             return response(credential)
         if method == "POST":
@@ -418,8 +507,10 @@ class FakeTenant:
         raise AssertionError(f"Unhandled fake request: {method} {url}")
 
     @staticmethod
-    def public(item):
-        return copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
+    def public(item, params=None):
+        fields = set(params["$select"].split(",")) if params and "$select" in params else None
+        return copy.deepcopy({key: value for key, value in item.items()
+                              if not key.startswith("_") and (fields is None or key in fields)})
 
     @staticmethod
     def not_found():
@@ -449,20 +540,22 @@ class NotebookTests(unittest.TestCase):
             self.assertTrue(ROOT.joinpath(name).is_file())
             self.assertIn(name, readme)
 
-    def run_walkthrough(self, *, opaque_graph=False, mode="device_code", demo_user=USER, pending_agent_reads=0):
-        backend = FakeTenant(opaque_graph=opaque_graph, demo_user=demo_user,
-                             pending_agent_reads=pending_agent_reads)
+    @contextlib.contextmanager
+    def notebook_session(self, backend=None, *, mode="device_code"):
+        backend = backend or FakeTenant()
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
             state_file = Path(temp).joinpath("state.json")
             stack.enter_context(patch.dict(os.environ, {
                 "TENANT_ID": TENANT, "AGENT_PREFIX": PREFIX, "AUTH_MODE": mode,
                 "AGENT_STATE_FILE": str(state_file),
-                "DEMO_USER_OBJECT_ID": demo_user, "BOOTSTRAP_CLIENT_ID": demo.BOOTSTRAP_CLIENT_ID,
+                "DEMO_USER_OBJECT_ID": backend.demo_user, "BOOTSTRAP_CLIENT_ID": demo.BOOTSTRAP_CLIENT_ID,
             }, clear=True))
             stack.enter_context(patch.object(demo.requests, "get",
                 return_value=response({"issuer": f"https://login.microsoftonline.com/{TENANT}/v2.0"})))
             stack.enter_context(patch.object(demo.requests, "request", side_effect=backend.graph_request))
             stack.enter_context(patch.object(demo.requests, "post", side_effect=backend.token_post))
+            stack.enter_context(patch.object(requests.sessions.Session, "request",
+                side_effect=AssertionError("Unexpected live HTTP request in an offline notebook test.")))
             stack.enter_context(patch.object(demo.msal, "PublicClientApplication", side_effect=backend.public_client))
             stack.enter_context(patch("IPython.display.display"))
             stack.enter_context(patch.object(demo.time, "sleep"))
@@ -471,6 +564,18 @@ class NotebookTests(unittest.TestCase):
             output = io.StringIO()
             stack.enter_context(contextlib.redirect_stdout(output))
             namespace = {"__name__": "__notebook_test__"}
+            yield backend, state_file, namespace, output
+
+    def execute_cell(self, cell_id, namespace, *, cleanup=False):
+        source = self.code_cells[cell_id]
+        if cleanup:
+            source = source.replace("CLEANUP = False", "CLEANUP = True", 1)
+        exec(compile(source, cell_id, "exec"), namespace)
+
+    def run_walkthrough(self, *, opaque_graph=False, mode="device_code", demo_user=USER, pending_agent_reads=0):
+        backend = FakeTenant(opaque_graph=opaque_graph, demo_user=demo_user,
+                             pending_agent_reads=pending_agent_reads)
+        with self.notebook_session(backend, mode=mode) as (backend, state_file, namespace, output):
             for source in self.code_cells.values():
                 exec(compile(source, "notebook", "exec"), namespace)
             creates = list(backend.creates)
@@ -486,8 +591,9 @@ class NotebookTests(unittest.TestCase):
                 for key in ("assertion", "client_assertion"):
                     if key in form:
                         self.assertNotIn(form[key], output.getvalue())
-            cleanup = self.code_cells["cleanup"].replace("CLEANUP = False", "CLEANUP = True", 1)
-            exec(compile(cleanup, "cleanup-rehearsal", "exec"), namespace)
+            cleanup_namespace = {"__name__": "__cleanup_test__"}
+            self.execute_cell("setup", cleanup_namespace)
+            self.execute_cell("cleanup", cleanup_namespace, cleanup=True)
             self.assertFalse(state_file.exists())
             self.assertEqual(backend.objects["applications"], {})
             self.assertEqual(backend.objects["oauth2PermissionGrants"], {})
@@ -509,6 +615,198 @@ class NotebookTests(unittest.TestCase):
     def test_full_notebook_waits_for_agent_app_id_propagation(self):
         output = self.run_walkthrough(pending_agent_reads=1)
         self.assertIn("object not ready", output)
+
+    def test_scope_id_survives_a_stale_blueprint_api_read(self):
+        with self.notebook_session() as (backend, state_file, namespace, output):
+            for cell_id in ("setup", "admin-sign-in", "create-blueprint", "expose-blueprint-api"):
+                self.execute_cell(cell_id, namespace)
+            scope_id = namespace["SCOPE_ID"]
+            stale = copy.deepcopy(namespace["blueprint"])
+            stale["api"] = {}
+            with patch.object(namespace["admin"], "get", return_value=stale):
+                self.execute_cell("expose-blueprint-api", namespace)
+            self.assertEqual(namespace["SCOPE_ID"], scope_id)
+            self.assertEqual(namespace["state"].get("scope_id"), scope_id)
+
+    def test_changed_scope_id_stops_without_overwriting_saved_state(self):
+        with self.notebook_session() as (backend, state_file, namespace, output):
+            for cell_id in ("setup", "admin-sign-in", "create-blueprint", "expose-blueprint-api"):
+                self.execute_cell(cell_id, namespace)
+            scope_id = namespace["SCOPE_ID"]
+            blueprint = backend.objects["applications"][namespace["BLUEPRINT_OBJECT_ID"]]
+            blueprint["api"]["oauth2PermissionScopes"][0]["id"] = OTHER_USER
+            with patch.object(namespace["admin"], "patch") as update:
+                with self.assertRaises(demo.DemoError):
+                    self.execute_cell("expose-blueprint-api", namespace)
+                update.assert_not_called()
+            self.assertEqual(namespace["state"].get("scope_id"), scope_id)
+
+    def test_cleanup_rejects_incomplete_or_forbidden_bootstrap_consent(self):
+        for granted in (
+            ["User.Read"],
+            [*demo.CLEANUP_PERMISSIONS, "Directory.AccessAsUser.All"],
+        ):
+            with self.subTest(granted=granted), self.notebook_session() as (_, _, namespace, _):
+                self.execute_cell("setup", namespace)
+                result = {"access_token": "offline-cleanup-token", "scope": " ".join(granted),
+                          "id_token_claims": {"tid": TENANT, "oid": USER}}
+                namespace["sign_in"] = Mock(return_value=result)
+                namespace["cleanup_demo"] = Mock()
+                with self.assertRaises(demo.DemoError):
+                    self.execute_cell("cleanup", namespace, cleanup=True)
+                namespace["cleanup_demo"].assert_not_called()
+
+    def test_setup_and_failed_admin_sign_in_clear_old_provisioning_approval(self):
+        for cell_id in ("setup", "admin-sign-in"):
+            with self.subTest(cell=cell_id), self.notebook_session() as (_, _, namespace, _):
+                self.execute_cell("setup", namespace)
+                namespace["PROVISIONING_APPROVED"] = True
+                if cell_id == "admin-sign-in":
+                    namespace["sign_in"] = Mock(side_effect=demo.DemoError("Sign-in cancelled."))
+                    with self.assertRaises(demo.DemoError):
+                        self.execute_cell(cell_id, namespace)
+                else:
+                    self.execute_cell(cell_id, namespace)
+                self.assertFalse(namespace["PROVISIONING_APPROVED"])
+
+    def test_cleanup_clears_provisioning_approval_even_when_deletion_fails(self):
+        with self.notebook_session() as (_, _, namespace, _):
+            self.execute_cell("setup", namespace)
+            namespace["PROVISIONING_APPROVED"] = True
+            namespace["cleanup_demo"] = Mock(side_effect=demo.DemoError("Cleanup failed."))
+            with self.assertRaises(demo.DemoError):
+                self.execute_cell("cleanup", namespace, cleanup=True)
+            self.assertFalse(namespace["PROVISIONING_APPROVED"])
+
+    def test_scope_id_is_saved_before_a_failed_graph_update(self):
+        with self.notebook_session() as (_, _, namespace, _):
+            for cell_id in ("setup", "admin-sign-in", "create-blueprint"):
+                self.execute_cell(cell_id, namespace)
+            with patch.object(namespace["admin"], "patch", side_effect=demo.ApiError(
+                503, "ServiceUnavailable", "Update outcome unknown."
+            )):
+                with self.assertRaises(demo.ApiError):
+                    self.execute_cell("expose-blueprint-api", namespace)
+            scope_id = namespace["state"].get("scope_id")
+            self.assertIsNotNone(scope_id)
+            self.execute_cell("expose-blueprint-api", namespace)
+            self.assertEqual(namespace["SCOPE_ID"], scope_id)
+
+    def test_expired_missing_and_explicitly_rotated_credentials_are_replaced(self):
+        for reason in ("expired", "missing", "explicit"):
+            with self.subTest(reason=reason), self.notebook_session() as (backend, _, namespace, _):
+                for cell_id in ("setup", "admin-sign-in", "create-blueprint", "blueprint-credential"):
+                    self.execute_cell(cell_id, namespace)
+                saved = dict(namespace["state"].get("blueprint_credential"))
+                blueprint = backend.objects["applications"][namespace["BLUEPRINT_OBJECT_ID"]]
+                if reason == "expired":
+                    blueprint["passwordCredentials"][0]["endDateTime"] = "2000-01-01T00:00:00Z"
+                elif reason == "missing":
+                    blueprint["passwordCredentials"] = []
+                source = self.code_cells["blueprint-credential"]
+                if reason == "explicit":
+                    source = source.replace("ROTATE_SECRET = False", "ROTATE_SECRET = True", 1)
+                exec(compile(source, "blueprint-credential", "exec"), namespace)
+                replacement = namespace["state"].get("blueprint_credential")
+                self.assertNotEqual(replacement["key_id"], saved["key_id"])
+                self.assertNotEqual(replacement["secret"], saved["secret"])
+                self.assertEqual(replacement["app_id"], namespace["BLUEPRINT_APP_ID"])
+                self.assertEqual(backend.creates.count("credential"), 2)
+                if reason == "explicit":
+                    self.assertIn(saved["key_id"], [key["keyId"] for key in blueprint["passwordCredentials"]])
+                self.execute_cell("blueprint-credential", namespace)
+                self.assertEqual(backend.creates.count("credential"), 2)
+
+    def test_tc_rejects_wrong_audience_user_tenant_client_scope_and_expiry(self):
+        with self.notebook_session() as (_, _, namespace, _):
+            for cell_id in self.code_cells:
+                self.execute_cell(cell_id, namespace)
+            valid = dict(namespace["tc_claims"])
+            for change in ({"aud": demo.GRAPH_APP_ID}, {"oid": OTHER_USER}, {"tid": OTHER_USER},
+                           {"azp": OTHER_USER}, {"scp": "User.Read"}, {"exp": time.time() - 1}):
+                with self.subTest(change=change):
+                    namespace["sign_in"] = Mock(return_value={"access_token": jwt({**valid, **change})})
+                    with self.assertRaises(demo.DemoError):
+                        self.execute_cell("acquire-tc", namespace)
+
+    def test_tg_rejects_wrong_audience_user_tenant_actor_and_extra_permissions(self):
+        with self.notebook_session() as (_, _, namespace, _):
+            for cell_id in self.code_cells:
+                self.execute_cell(cell_id, namespace)
+            valid = dict(namespace["tg_claims"])
+            for change in ({"aud": USER}, {"oid": OTHER_USER}, {"tid": OTHER_USER},
+                           {"appid": USER}, {"scp": "User.Read Mail.Read"}, {"scp": ""}):
+                with self.subTest(change=change):
+                    namespace["request_token"] = Mock(return_value={"access_token": jwt({**valid, **change})})
+                    with self.assertRaises(demo.DemoError):
+                        self.execute_cell("acquire-tg", namespace)
+
+    def test_opaque_graph_token_without_scope_metadata_still_calls_graph(self):
+        backend = FakeTenant(opaque_graph=True)
+        with self.notebook_session(backend) as (_, _, namespace, output):
+            for cell_id in self.code_cells:
+                if cell_id == "acquire-tg":
+                    original = namespace["request_token"]
+
+                    def without_scope(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        result.pop("scope", None)
+                        return result
+
+                    namespace["request_token"] = without_scope
+                self.execute_cell(cell_id, namespace)
+            self.assertIn("Effective scopes are not inspectable here", output.getvalue())
+            self.assertIn("GET /me succeeded using Tg", output.getvalue())
+            self.assertIn("Expected denial: HTTP 403", output.getvalue())
+
+    def test_cleanup_after_partial_setup_needs_only_setup_in_a_fresh_namespace(self):
+        with self.notebook_session() as (backend, state_file, namespace, _):
+            for cell_id in ("setup", "admin-sign-in", "create-blueprint", "blueprint-credential"):
+                self.execute_cell(cell_id, namespace)
+            cleanup_namespace = {"__name__": "__partial_cleanup_test__"}
+            self.execute_cell("setup", cleanup_namespace)
+            self.execute_cell("cleanup", cleanup_namespace, cleanup=True)
+            self.assertFalse(state_file.exists())
+            self.assertEqual(backend.objects["applications"], {})
+
+    def test_partial_cleanup_can_be_resumed_after_restart(self):
+        with self.notebook_session() as (backend, state_file, namespace, _):
+            for cell_id in self.code_cells:
+                self.execute_cell(cell_id, namespace)
+            client_id = namespace["CLIENT_APP_OBJECT_ID"]
+
+            def fail_client_delete(method, url, **kwargs):
+                if method == "DELETE" and url.endswith(f"/applications/{client_id}"):
+                    return response({"error": {"code": "Authorization_RequestDenied", "message": "denied"}}, 403)
+                return backend.graph_request(method, url, **kwargs)
+
+            with patch.object(demo.requests, "request", side_effect=fail_client_delete):
+                with self.assertRaises(demo.ApiError):
+                    self.execute_cell("cleanup", namespace, cleanup=True)
+            self.assertTrue(state_file.exists())
+            self.assertTrue(namespace["state"].get("cleanup_started"))
+            self.assertEqual(backend.objects["oauth2PermissionGrants"], {})
+            self.assertNotIn(namespace["AGENT_ID"], backend.objects["servicePrincipals"])
+            cleanup_namespace = {"__name__": "__resumed_cleanup_test__"}
+            self.execute_cell("setup", cleanup_namespace)
+            self.execute_cell("cleanup", cleanup_namespace, cleanup=True)
+            self.assertFalse(state_file.exists())
+            self.assertEqual(backend.objects["applications"], {})
+            self.assertEqual(len(backend.objects["servicePrincipals"]), 1)
+
+    def test_svg_and_excalidraw_labels_and_bindings_agree(self):
+        drawing = json.loads(ROOT.joinpath("entra-obo-token-exchange.excalidraw").read_text(encoding="utf-8"))
+        svg = ET.parse(ROOT.joinpath("entra-obo-token-exchange.svg"))
+        svg_labels = ["".join(element.itertext()) for element in svg.iter("{http://www.w3.org/2000/svg}text")]
+        drawing_labels = [element["text"] for element in drawing["elements"] if element["type"] == "text"]
+        self.assertEqual(sorted(svg_labels), sorted(drawing_labels))
+        ids = {element["id"] for element in drawing["elements"]}
+        self.assertEqual(len(ids), len(drawing["elements"]))
+        for element in drawing["elements"]:
+            for binding in element.get("boundElements", []):
+                self.assertIn(binding["id"], ids)
+            if element.get("containerId"):
+                self.assertIn(element["containerId"], ids)
 
 
 if __name__ == "__main__":

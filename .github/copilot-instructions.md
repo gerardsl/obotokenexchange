@@ -29,13 +29,16 @@ Prepare sections 1-6, then present 7-11 in the same kernel. For offline validati
 ```powershell
 .\.venv\Scripts\python.exe -m unittest -v
 .\.venv\Scripts\python.exe -m unittest tests.test_demo.HelperTests.test_only_access_denied_403_counts_as_permission_boundary -v
+.\.venv\Scripts\python.exe -m unittest tests.test_demo.NotebookTests.test_full_notebook_replay_and_cleanup_with_mocked_transport -v
 ```
 
-The tests execute the actual notebook cells with mocked authentication/HTTP, including full reruns and cleanup. They do not establish live tenant readiness.
+The helper command is an example of running one unit test; the notebook command runs one focused end-to-end replay. Tests execute the actual notebook cells with mocked authentication/HTTP, including full reruns and cleanup. They do not establish live tenant readiness.
 
 ## Architecture
 
 `entra_agent_obo.ipynb` is the executable narrative; `README.md` is the operator/audience guide. `demo_support.py` contains HTTP, diagnostic, retry, state, grant, and cleanup helpers. The notebook retains explicit provisioning calls and T1/Tg form bodies rather than hiding the protocol behind an Agent ID SDK. MSAL handles device-code or browser sign-in; `requests` handles token exchanges and Graph calls.
+
+`tests\test_demo.py` has two layers: direct helper tests and a `FakeTenant` transport that executes every notebook code cell, reruns the notebook to detect duplicate resources or secrets, exercises alternate authentication/token behavior, and then runs cleanup in a fresh namespace. `notebook_session()` centralizes mocked I/O and blocks accidental live HTTP calls. Notebook code-cell IDs are part of the test contract; preserve existing IDs, especially `cleanup`, when editing or regenerating the notebook.
 
 The numbered sections form a dependency chain through shared kernel globals:
 
@@ -57,18 +60,18 @@ Keep notebook Markdown, claim displays, the section 11 request recap, and README
 - **Distinguish application IDs from directory object IDs.** `*_APP_ID` values are OAuth client IDs. `BLUEPRINT_OBJECT_ID`, `CLIENT_APP_OBJECT_ID`, and `AGENT_ID` are directory object IDs. The delegated grant uses `clientId=AGENT_ID` and `resourceId=GRAPH_SP_ID`; `fmi_path` uses `AGENT_APP_ID`, and `agentIdentityBlueprintId` uses `BLUEPRINT_APP_ID`.
 - **Keep the two consent relationships separate.** Frontend preauthorization is for `access_agent`. The child's Graph grant uses `consentType="Principal"`, the selected user's `principalId`, and exactly `User.Read`. The blueprint's `requiredResourceAccess` is only a declaration. Unexpected broader/tenant-wide/other-user grants stop the run instead of being changed.
 - **Preserve the limited-permission demonstration.** Section 10 allows `/v1.0/me` and expects a recognized HTTP 403 access denial for `/v1.0/users`. Do not grant `User.ReadBasic.All` to make the second call succeed. Other errors and unexpected successes must fail, not masquerade as an expected refusal. A member user avoids guest-access restrictions confounding this comparison.
-- **Use the existing HTTP helpers.** `Graph` centralizes Graph requests, including the required `OData-Version: 4.0` header. Call sites supply explicit `/v1.0/` or `/beta/` paths; preserve this distinction. `request_token(**form)` sends form-encoded data to the tenant's v2.0 token endpoint, not JSON.
+- **Use the existing HTTP helpers.** `Graph` centralizes Graph requests, including the required `OData-Version: 4.0` header. Call sites supply explicit `/v1.0/` or `/beta/` paths; preserve this distinction. `request_token(TOKEN_ENDPOINT, **form)` sends form-encoded data to the tenant's v2.0 token endpoint, not JSON.
 - **Allow for directory propagation without hiding failures.** `retry()` handles explicit propagation conditions, throttling and safely retryable service errors. Consent-pending retries are opt-in for OBO. Do not broadly retry programming errors, policy denials, user sign-ins, or ambiguous resource-creation failures.
-- **Preserve the bootstrap permission restriction.** The admin token must not carry `Directory.AccessAsUser.All`; the notebook rejects it because Agent ID APIs refuse it. Do not substitute an Azure CLI token for the default bootstrap device-code flow.
+- **Preserve the bootstrap permission restriction.** Both provisioning and cleanup use `require_admin_consent()` to check tenant, required scopes, and absence of `Directory.AccessAsUser.All`. Do not substitute an Azure CLI token for the documented bootstrap flow. Keep this notebook safeguard distinct from the permissions the platform blocks for agent identities themselves.
 - **Keep token inspection diagnostic.** `decode_jwt()` does not validate signatures. Graph tokens may be opaque; report that and use the token without inventing claims. Reuse `claim()` and `show_claims()` for v1/v2 names. Use fingerprints and redacted request views, not token/secret prefixes or full credentials. Do not parse T1's FMI subject as a literal child appId.
 - **Keep permission/error documentation grounded.** `ADMIN_PERMISSIONS` and `CLEANUP_PERMISSIONS` define the actual requested scopes; the README must explain all of them. AADSTS65002 is a first-party preauthorization error, not a generic individual-scope error.
 
 ## State and cleanup
 
-`DemoState` binds resources to tenant, prefix, and selected demo user. Reuse recorded IDs and verify their identity/parent; never adopt arbitrary name matches. The same blueprint's scope ID and valid credential must survive repeated cell execution.
+`DemoState` binds resources to tenant, prefix, and selected demo user. Reuse recorded IDs and verify their identity/parent; never adopt arbitrary name matches. Persist the API scope ID before its Graph update and reuse it after stale reads; conflicting live IDs stop the run. Read recorded grants by ID as well as checking the collection, so stale lists cannot create duplicates. The same blueprint's valid credential must survive repeated cell execution.
 
-The default Windows state file is `%LOCALAPPDATA%\EntraOboDemo\<tenant-id>-<prefix>.json`, outside this OneDrive-backed workspace. It contains the plaintext development secret. `DemoState.save()` writes atomically and updates memory only after success. Credential reuse checks the live key, matching blueprint appId, and expiry; never recommend deleting state to fix a bad secret.
+The default Windows state file is `%LOCALAPPDATA%\EntraOboDemo\<tenant-id>-<prefix>.json`, outside this OneDrive-backed workspace. It contains the plaintext development secret. `DemoState.save()` writes atomically and updates memory only after success. Credential reuse checks the live key, matching blueprint appId, and expiry; never recommend deleting state to fix a bad secret. `ROTATE_SECRET` adds a credential and changes the saved value; it does not revoke older Entra credentials.
 
 Keep `.env` and all private state files out of commits. Clear notebook outputs and execution counts before committing; even the diagnostic output contains tenant IDs, object IDs, and user information.
 
-Section 12 defaults to `CLEANUP = False`, requires prefix confirmation, and authenticates separately with cleanup scopes. It explicitly deletes only recorded objects, refuses extra child identities, and retains state after any partial failure. It can run after section 1 alone. Do not rely on implicit deletion cascades or claim the admin center can restore Agent ID objects.
+Section 12 defaults to `CLEANUP = False`, requires prefix confirmation, and authenticates separately with cleanup scopes. It explicitly deletes only recorded objects, refuses extra child identities, and retains state after any partial failure. It can run after section 1 alone. Setup/admin-sign-in reruns and enabled cleanup clear `PROVISIONING_APPROVED`; preserve this protection against stale kernel state. Do not rely on implicit deletion cascades or claim the admin center can restore Agent ID objects.

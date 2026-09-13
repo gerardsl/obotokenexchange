@@ -282,6 +282,16 @@ def sign_in(client_id, authority, scopes, mode, label):
     return result
 
 
+def require_admin_consent(result, tenant_id, scopes):
+    require(result.get("id_token_claims", {}).get("tid") == tenant_id,
+            "Administrator signed into the wrong tenant.")
+    granted_scopes = {scope.rsplit("/", 1)[-1] for scope in result.get("scope", "").split()}
+    require("Directory.AccessAsUser.All" not in granted_scopes,
+            "Use the documented bootstrap client with explicit scopes, not an Azure CLI token.")
+    missing = set(scopes) - granted_scopes
+    require(not missing, f"Bootstrap consent is incomplete. Missing scopes: {sorted(missing)}")
+
+
 class Graph:
     def __init__(self, token):
         self.token = token
@@ -408,7 +418,8 @@ def recorded_resource(graph, state, name, path_template):
             raise
         raise DemoError(f"The recorded {name} no longer exists. Finish cleanup or restore it; "
                         "do not silently replace it with another object.") from exc
-    for key in ("id", "appId", "displayName", "agentIdentityBlueprintId"):
+    for key in ("id", "appId", "displayName", "agentIdentityBlueprintId",
+                "clientId", "resourceId", "principalId", "consentType", "scope"):
         if key in saved:
             require(current.get(key) == saved[key],
                     f"The recorded {name} has a different {key}. Stop and inspect it in Entra.")
@@ -432,19 +443,24 @@ def find_service_principal(graph, app_id, *, blueprint=False):
 
 
 def ensure_graph_grant(graph, state, agent_id, graph_sp_id, user_id):
-    grants = graph.list("/v1.0/oauth2PermissionGrants", {
-        "$filter": f"clientId eq '{agent_id}' and resourceId eq '{graph_sp_id}'",
-    })
+    recorded = recorded_resource(graph, state, "grant", RESOURCE_PATHS["grant"])
     expected = {
         "clientId": agent_id, "resourceId": graph_sp_id,
         "consentType": "Principal", "principalId": user_id, "scope": "User.Read",
     }
+    require(recorded is None or all(recorded.get(key) == value for key, value in expected.items()),
+            "The recorded grant does not match this agent, resource, user and User.Read scope. Nothing was changed.")
+    grants = graph.list("/v1.0/oauth2PermissionGrants", {
+        "$filter": f"clientId eq '{agent_id}' and resourceId eq '{graph_sp_id}'",
+    })
     require(len(grants) <= 1 and all(
         all(grant.get(key) == value for key, value in expected.items()) for grant in grants
     ), "This agent has unexpected Graph grants (another user, tenant-wide consent or broader scopes). "
        "Nothing was changed. Inspect the grants or use a fresh demo prefix.")
-    if grants:
-        grant = grants[0]
+    require(recorded is None or all(grant["id"] == recorded["id"] for grant in grants),
+            "Graph returned a different grant from the recorded one. Nothing was changed; inspect the grants.")
+    grant = recorded or (grants[0] if grants else None)
+    if grant is not None:
         print("Reusing the exact one-user User.Read grant.")
     else:
         grant = retry(lambda: graph.post("/v1.0/oauth2PermissionGrants", expected),

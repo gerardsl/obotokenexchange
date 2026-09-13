@@ -4,6 +4,10 @@ This notebook shows **a real Microsoft Entra Agent ID identity acting on behalf 
 
 The notebook plays both the frontend and the agent backend. There is no LLM or deployed agent application to set up. The identity, consent records, and tokens are real.
 
+## Presentation
+
+The [30-slide PowerPoint walkthrough](output/Entra-Agent-ID-OBO-Exchange.pptx) explains the full exchange with editable diagrams, exact token requests, speaker notes, and operator references for permissions, state, and cleanup. Examples are illustrative; the presentation distinguishes offline verification from a live tenant rehearsal.
+
 ## The idea in one minute
 
 Think of **a ticket, a badge, and a pass**:
@@ -52,7 +56,7 @@ scope                 = https://graph.microsoft.com/.default
 
 The important switch is **`client_id`: blueprint for T1, child agent for Tg**. The two assertions in the OBO request have different jobs: `client_assertion` authenticates the agent; `assertion` supplies the user context.
 
-Here, Graph `/.default` requests already-granted permissions. It does **not** mean every Graph permission and does not create consent. The token-exchange request uses `api://AzureADTokenExchange/.default`; do not generalize this example into a claim that every OBO resource request must use `/.default`.
+Here, Graph `/.default` requests already-granted permissions. It does **not** mean every Graph permission, and this non-interactive OBO exchange cannot obtain missing user consent. Other flows can use `/.default` to prompt for configured permissions. The token-exchange request uses `api://AzureADTokenExchange/.default`; do not generalize this example into a claim that every OBO resource request must use `/.default`.
 
 ## What the notebook does
 
@@ -108,7 +112,7 @@ The **demo user needs no administrator role for OBO**. Selecting the administrat
 
 ### Delegated Graph scopes: what the bootstrap client may do
 
-Section 2 requests these **11 delegated permissions**, defined with their purposes in `demo_support.py`. An administrator must approve the bootstrap client's permissions according to tenant policy.
+Section 2 requests these **11 delegated permissions**, defined with their purposes in `demo_support.py` and the [Microsoft Graph permissions reference](https://learn.microsoft.com/en-us/graph/permissions-reference). An administrator must approve the bootstrap client's permissions according to tenant policy.
 
 | Delegated scope | Why this notebook requests it |
 |-----------------|-------------------------------|
@@ -124,7 +128,7 @@ Section 2 requests these **11 delegated permissions**, defined with their purpos
 | `AgentIdentity.Create.All` | Create the child agent identity as the administrator. |
 | `DelegatedPermissionGrant.ReadWrite.All` | Read/write the child's one-user delegated Graph grant. This is also a powerful setup permission. |
 
-The default bootstrap app is **Microsoft Graph Command Line Tools** (`14d82eec-204b-4c2f-b7e8-296a70dab67e`), the app used by `Connect-MgGraph`. Do not substitute an Azure CLI token: Agent ID APIs reject provisioning tokens carrying `Directory.AccessAsUser.All`.
+The default bootstrap app is **Microsoft Graph Command Line Tools** (`14d82eec-204b-4c2f-b7e8-296a70dab67e`), the app used by `Connect-MgGraph`. Do not substitute an Azure CLI token: this notebook requires explicit setup/cleanup scopes and rejects tokens carrying `Directory.AccessAsUser.All`. This bootstrap safeguard is separate from the platform's restrictions on permissions granted to agent identities themselves.
 
 If your organization disallows the default bootstrap client, use an **organization-approved ordinary public-client registration** via `BOOTSTRAP_CLIENT_ID`. Configure the delegated Graph permissions above, grant the required admin consent, enable public-client flows, and register **Mobile and desktop applications > `http://localhost`** if using interactive browser sign-in. It needs no client secret. Creating/approving this bootstrap registration is an administrator prerequisite, not a privilege the child agent acquires.
 
@@ -223,7 +227,11 @@ If a token expires while you are speaking, rerun sections 7-10. The live sign-in
 
 On Windows, the default state is `%LOCALAPPDATA%\EntraOboDemo\<tenant-id>-<prefix>.json`, **outside this OneDrive-backed workspace**. It contains object IDs and the blueprint's plaintext development secret. Keep it private; do not move it into a shared/synced folder.
 
-State is bound to the resolved tenant, prefix, and demo user. Reruns reuse recorded objects, scope IDs, exact grants, and a saved credential only while its key still exists and is unexpired. A stale or expired credential is replaced; `ROTATE_SECRET = True` in the credential cell permits explicit rotation. Restore that switch to `False` afterward.
+State is bound to the resolved tenant, prefix, and demo user. Reruns reuse recorded objects, scope IDs, exact grants, and a saved credential only while its key still exists and is unexpired. The API scope ID is saved before the Graph update and reused if a later read is stale. The recorded grant is read by ID as well as checking the grant collection; an empty, stale list does not cause duplicate creation. Changed scope IDs and missing, changed, or replaced recorded grants stop the run.
+
+A stale or expired credential is replaced; `ROTATE_SECRET = True` in the credential cell permits explicit rotation. Restore that switch to `False` afterward. **Rotation adds a new Entra credential and updates the local saved value; it does not revoke older credentials.** Older credentials remain until expiry, explicit removal, or blueprint deletion. Do not treat this switch as complete remediation for a compromised secret.
+
+Rerunning section 1 or 2 clears previous provisioning approval, as does enabling cleanup. Confirm provisioning again in section 2 before further setup writes; finish any partial cleanup before starting another provisioning run.
 
 Do **not** delete state to fix a failed exchange: that loses the resource/credential association. An untracked matching name, changed object, or incompatible grant stops the notebook. If a create request times out, creation might have completed; inspect the named object and preserve/recover state rather than blindly repeating writes. Use one kernel per state file.
 
@@ -231,7 +239,7 @@ Clear outputs and execution counts before sharing or committing. Token fingerpri
 
 ### Offline checks
 
-These run the notebook cells with mocked authentication and Graph transport, including reruns, opaque Graph tokens, both sign-in modes, and cleanup. **They are not a live tenant rehearsal.**
+These run the actual notebook cells with mocked authentication and Graph transport, including reruns, stale directory reads, credential replacement, invalid token claims, opaque Graph tokens with or without scope metadata, both sign-in modes, and cleanup after a simulated kernel restart or partial failure. The fake transport checks which token is used, honors `$select`, and blocks accidental live HTTP requests. **These checks are not a live tenant rehearsal.**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest -v
@@ -243,13 +251,19 @@ Run one focused check:
 .\.venv\Scripts\python.exe -m unittest tests.test_demo.HelperTests.test_only_access_denied_403_counts_as_permission_boundary -v
 ```
 
+Run one full mocked notebook replay, including rerun and cleanup:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_demo.NotebookTests.test_full_notebook_replay_and_cleanup_with_mocked_transport -v
+```
+
 ## Cleanup
 
-Run section 12 only when you are done. Set `CLEANUP = True`, confirm `delete <prefix>`, and complete the cleanup administrator sign-in.
+Run section 12 only when you are done. Set `CLEANUP = True`, confirm `delete <prefix>`, and complete the cleanup administrator sign-in. Before any deletion, the notebook checks the tenant and all requested cleanup scopes and rejects `Directory.AccessAsUser.All`; active roles and per-object authorization still need to permit the operations.
 
 Cleanup explicitly removes only the recorded consent grant, child agent, public-client principal/application, and blueprint principal/application. It refuses a blueprint with additional child identities. If any deletion fails, it **keeps the state file** so you can resolve permissions and retry. To recover after restarting the kernel or an incomplete setup, run **section 1, then section 12**.
 
-Agent ID objects are soft-deleted for 30 days; restoring them requires Graph or Microsoft Entra PowerShell. Do not assume an admin-center restore action exists. Local state deletion alone does not remove cloud objects or revoke their credentials. Already-issued access tokens can remain valid until expiration.
+Agent ID objects are soft-deleted for 30 days; restoring them requires Graph or Microsoft Entra PowerShell. Entra can also cascade blueprint/principal deletion to child identities asynchronously; this notebook deletes recorded children first instead of depending on that timing. Do not assume an admin-center restore action exists. Local state deletion alone does not remove cloud objects or revoke their credentials. Already-issued access tokens can remain valid until expiration.
 
 The notebook does not revoke the administrator's consent to the shared bootstrap application, because other tools may rely on it. An administrator should review any newly approved bootstrap permissions under the organization's normal consent process.
 
@@ -259,7 +273,7 @@ Read the full Entra/Graph error and request/correlation ID; a single code can ha
 
 | Symptom | Meaning / action |
 |---------|------------------|
-| `403 Authorization_RequestDenied` during setup | Check both the requested Graph scopes and active directory roles. Agent ID read/create/delete scopes are distinct. A `Directory.AccessAsUser.All` provisioning token is also unsupported. |
+| `403 Authorization_RequestDenied` during setup | Check both the requested Graph scopes and active directory roles. Agent ID read/create/delete scopes are distinct. The notebook also refuses a bootstrap token carrying `Directory.AccessAsUser.All`. |
 | `AADSTS50013` during OBO | Assertion validation failed. In this flow, check that Tc targets the blueprint, not Graph; also check token lifetime and the complete error text. |
 | `AADSTS65001` | Consent is missing or not yet propagated. Check the child agent object ID, Graph resource object ID, `Principal`/user ID, and `User.Read` grant in section 6. |
 | `AADSTS65002` | First-party application/resource preauthorization problem, **not** a generic invalid-scope error. Verify the bootstrap client; use an approved registration rather than reusing an unsuitable Microsoft app ID. |
@@ -284,17 +298,24 @@ Prefer federated credentials with managed identities or certificates over saved 
 - [Create child agent identities](https://learn.microsoft.com/en-us/graph/api/agentidentity-post?view=graph-rest-beta)
 - [Delegated permission-grant schema and object-ID requirements](https://learn.microsoft.com/en-us/graph/api/oauth2permissiongrant-post?view=graph-rest-1.0)
 - [Declarations, direct grants, and inheritance](https://learn.microsoft.com/en-us/entra/agent-id/concept-inheritable-permissions)
+- [The `.default` scope and preauthorization](https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc)
 - [Interactive authentication versus consent-only flows](https://learn.microsoft.com/en-us/entra/agent-id/interactive-agent-authentication-authorization-flow)
 - [Agent token claims and opaque-token guidance](https://learn.microsoft.com/en-us/entra/agent-id/agent-tokens)
 - [List-users permission requirements](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0)
 - [Agent ID limits, propagation, and recovery FAQ](https://learn.microsoft.com/en-us/entra/agent-id/faq)
+- [Agent ID deletion and asynchronous cascade behavior](https://learn.microsoft.com/en-us/entra/agent-id/concept-agent-identity-deletion)
+- [Delete and restore agent identity objects](https://learn.microsoft.com/en-us/entra/agent-id/howto-delete-agent-identity)
 - [Agent sign-in and audit logs](https://learn.microsoft.com/en-us/entra/agent-id/sign-in-audit-logs-agents)
+- [Verify the Microsoft Graph Command Line Tools application ID](https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/governance/verify-first-party-apps-sign-in#application-ids-of-microsoft-tenant-owned-applications)
+- [Microsoft Entra authentication error-code reference](https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes)
 - [Official AADSTS65002 explanation](https://login.microsoftonline.com/error?code=65002)
 
 ## Verification Summary
 
-Reviewed on **2026-09-07**: **38 substantive cross-file claims** against the implementation, current Microsoft references, and local dependency behavior: **17 confirmed, 20 corrected, 1 tenant-dependent**. Corrections include permission coverage, setup/architecture compatibility, grant scope, rerun/state handling, token/error explanations, and cleanup behavior.
+Reviewed on **2026-09-12** across the README, notebook narrative and code, support module, tests, Copilot instructions, configuration template, ignore rules, and both diagram formats. **50 grouped cross-file claims** were checked against the implementation, Microsoft references, and local execution: **43 confirmed, 6 corrected, 1 tenant-dependent**.
 
-**Local result:** 29 offline tests pass, including execution of the actual notebook cells with mocked transport, full reruns, both sign-in modes, delayed agent appId propagation, opaque Graph tokens, and cleanup. The registered Jupyter kernel also starts and imports the dependencies on Python 3.13.15 x64.
+Corrections preserve scope IDs through stale reads and failed updates, reuse consent by its recorded ID, validate cleanup consent and clear stale provisioning approval, clarify that secret rotation does not revoke earlier credentials, distinguish the notebook's bootstrap safeguard from permissions blocked for agents, and correct the token helper's documented call signature.
 
-**A live run in your tenant has not yet been confirmed.** The local checks cannot prove your roles, consent policy, Conditional Access, quotas, or the exact tokens Entra will issue there. Rehearse sections 1-11 successfully in the intended tenant before presenting; retain this distinction when describing the demo's readiness.
+**Local result:** 48 offline tests pass. Coverage includes full replays, both sign-in modes, credential expiry/rotation, rejected token claims, delayed directory reads, opaque Graph tokens, and cleanup after partial failure or a simulated kernel restart. Dependencies pass `pip check`; the registered kernel starts on Python 3.13.15 x64, and the authenticated local notebook server serves the notebook and SVG. Both diagram sources agree, and the SVG was rendered and visually inspected. Sources also parse using Python 3.11 grammar; execution was checked on the installed 3.13 runtime.
+
+**A live run in your tenant has not been verified.** No tenant provisioning, real token exchange, or tenant deletion was performed in this review. Local checks cannot prove your roles, consent policy, Conditional Access, quotas, or the exact tokens Entra will issue. Rehearse sections 1-11 with the provisioning administrator and selected demo user in the intended development tenant before presenting.
